@@ -77,7 +77,7 @@ struct X509_VERIFY_PARAM(c_void);
 
 #[allow(non_camel_case_types)]
 #[repr(transparent)]
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 struct X509_STORE(c_void);
 
 #[allow(non_camel_case_types)]
@@ -86,7 +86,7 @@ struct X509_STORE_CTX(c_void);
 
 #[allow(non_camel_case_types)]
 #[repr(transparent)]
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 struct X509(c_void);
 
 #[allow(non_camel_case_types)]
@@ -272,9 +272,54 @@ impl Context {
         })
     }
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     fn load_ca_certs(&mut self) -> Result<()> {
         unsafe { map_result(SSL_CTX_set_default_verify_paths(self.as_mut_ptr())) }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn load_ca_certs(&mut self) -> Result<()> {
+        use security_framework::trust_settings::{
+            Domain,
+            TrustSettings,
+            TrustSettingsForCertificate::{TrustRoot, TrustAsRoot},
+        };
+
+        let ctx_store = unsafe { SSL_CTX_get_cert_store(self.as_mut_ptr()) };
+        if ctx_store.is_null() {
+            return Err(Error::TlsFail);
+        }
+
+        for domain in &[Domain::User, Domain::Admin, Domain::System] {
+            let ts = TrustSettings::new(*domain);
+            let iter = ts.iter().map_err(|_| Error::TlsFail)?;
+
+            for cert in iter {
+                let der = cert.to_der();
+
+                let trusted = ts
+                    .tls_trust_settings_for_certificate(&cert)
+                    .map_err(|_| Error::TlsFail)?
+                    .unwrap_or(TrustRoot);
+
+                if let TrustRoot | TrustAsRoot = trusted {
+                    unsafe {
+                        let cert = d2i_X509(
+                            ptr::null_mut(),
+                            &der.as_ptr(),
+                            der.len() as i32,
+                        );
+
+                        if !cert.is_null() {
+                            X509_STORE_add_cert(ctx_store, cert);
+                        }
+
+                        X509_free(cert);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -1297,10 +1342,10 @@ extern {
         ctx: *mut SSL_CTX, file: *const c_char, path: *const c_char,
     ) -> c_int;
 
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     fn SSL_CTX_set_default_verify_paths(ctx: *mut SSL_CTX) -> c_int;
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn SSL_CTX_get_cert_store(ctx: *mut SSL_CTX) -> *mut X509_STORE;
 
     fn SSL_CTX_set_verify(
@@ -1464,13 +1509,13 @@ extern {
     ) -> c_int;
 
     // X509_STORE
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn X509_STORE_add_cert(ctx: *mut X509_STORE, x: *mut X509) -> c_int;
 
     // X509
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn X509_free(x: *mut X509);
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "macos"))]
     fn d2i_X509(px: *mut X509, input: *const *const u8, len: c_int) -> *mut X509;
 
     // STACK_OF
