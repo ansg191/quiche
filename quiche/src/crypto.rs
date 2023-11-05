@@ -24,9 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::convert::TryFrom;
 use std::mem::MaybeUninit;
-
-use ring::aead;
 
 use libc::c_int;
 use libc::c_void;
@@ -77,14 +76,6 @@ impl Algorithm {
             Algorithm::ChaCha20_Poly1305 => unsafe {
                 EVP_aead_chacha20_poly1305()
             },
-        }
-    }
-
-    fn get_ring_hp(self) -> &'static aead::quic::Algorithm {
-        match self {
-            Algorithm::AES128_GCM => &aead::quic::AES_128,
-            Algorithm::AES256_GCM => &aead::quic::AES_256,
-            Algorithm::ChaCha20_Poly1305 => &aead::quic::CHACHA20,
         }
     }
 
@@ -216,11 +207,7 @@ impl Open {
             return Ok(<[u8; 5]>::default());
         }
 
-        let mask = self
-            .header
-            .hpk
-            .new_mask(sample)
-            .map_err(|_| Error::CryptoFail)?;
+        let mask = self.header.new_mask(sample)?;
 
         Ok(mask)
     }
@@ -347,11 +334,7 @@ impl Seal {
             return Ok(<[u8; 5]>::default());
         }
 
-        let mask = self
-            .header
-            .hpk
-            .new_mask(sample)
-            .map_err(|_| Error::CryptoFail)?;
+        let mask = self.header.new_mask(sample)?;
 
         Ok(mask)
     }
@@ -381,16 +364,17 @@ impl Seal {
 }
 
 pub struct HeaderProtectionKey {
-    hpk: aead::quic::HeaderProtectionKey,
-
+    alg: Algorithm,
     hp_key: Vec<u8>,
 }
 
 impl HeaderProtectionKey {
     pub fn new(alg: Algorithm, hp_key: Vec<u8>) -> Result<Self> {
-        aead::quic::HeaderProtectionKey::new(alg.get_ring_hp(), &hp_key)
-            .map(|hpk| Self { hpk, hp_key })
-            .map_err(|_| Error::CryptoFail)
+        if hp_key.len() == alg.key_len() {
+            Ok(Self { alg, hp_key })
+        } else {
+            Err(Error::CryptoFail)
+        }
     }
 
     pub fn from_secret(aead: Algorithm, secret: &[u8]) -> Result<Self> {
@@ -401,6 +385,18 @@ impl HeaderProtectionKey {
         derive_hdr_key(aead, secret, &mut hp_key)?;
 
         Self::new(aead, hp_key)
+    }
+
+    pub fn new_mask(&self, sample: &[u8]) -> Result<[u8; 5]> {
+        const SAMPLE_LEN: usize = 16;
+        let sample: &[u8; SAMPLE_LEN] =
+            TryFrom::try_from(sample).map_err(|_| Error::CryptoFail)?;
+
+        match self.alg {
+            Algorithm::AES128_GCM => aes_mask(128, &self.hp_key, sample),
+            Algorithm::AES256_GCM => aes_mask(256, &self.hp_key, sample),
+            Algorithm::ChaCha20_Poly1305 => chacha_mask(&self.hp_key, sample),
+        }
     }
 }
 
@@ -692,8 +688,8 @@ fn hkdf_expand_label(prk: &Prk, label: &[u8], out: &mut [u8]) -> Result<()> {
     prk.expand(&info, out.len(), out)
 }
 
-fn make_nonce(iv: &[u8], counter: u64) -> [u8; aead::NONCE_LEN] {
-    let mut nonce = [0; aead::NONCE_LEN];
+fn make_nonce(iv: &[u8], counter: u64) -> [u8; 12] {
+    let mut nonce = [0; 12];
     nonce.copy_from_slice(iv);
 
     // XOR the last bytes of the IV with the counter. This is equivalent to
@@ -703,6 +699,64 @@ fn make_nonce(iv: &[u8], counter: u64) -> [u8; aead::NONCE_LEN] {
     }
 
     nonce
+}
+
+fn make_aes(bits: u16, key: &[u8]) -> Result<AES_KEY> {
+    let mut aes_key = MaybeUninit::uninit();
+
+    let aes_key = unsafe {
+        let rc = AES_set_encrypt_key(
+            key.as_ptr(),
+            bits as libc::c_uint,
+            aes_key.as_mut_ptr(),
+        );
+
+        if rc != 0 {
+            return Err(Error::CryptoFail);
+        }
+
+        aes_key.assume_init()
+    };
+
+    Ok(aes_key)
+}
+
+fn aes_mask(bits: u16, key: &[u8], sample: &[u8; 16]) -> Result<[u8; 5]> {
+    let aes = make_aes(bits, key)?;
+
+    let mut block = [0; 16];
+    unsafe {
+        AES_encrypt(sample.as_ptr(), block.as_mut_ptr(), &aes);
+    }
+
+    let mut out = [0; 5];
+    out.copy_from_slice(&block[..5]);
+    Ok(out)
+}
+
+fn chacha_mask(key: &[u8], sample: &[u8; 16]) -> Result<[u8; 5]> {
+    let mut out = [0; 5];
+
+    let key: &[u8; 32] = TryFrom::try_from(key).map_err(|_| Error::CryptoFail)?;
+
+    let counter = u32::from_le_bytes(
+        TryFrom::try_from(&sample[..4]).unwrap_or_else(|_| unreachable!()),
+    );
+    let nonce: &[u8; 12] =
+        TryFrom::try_from(&sample[4..16]).unwrap_or_else(|_| unreachable!());
+
+    unsafe {
+        CRYPTO_chacha_20(
+            out.as_mut_ptr(),
+            out.as_ptr(),
+            out.len(),
+            key,
+            nonce,
+            counter,
+        )
+    }
+
+    Ok(out)
 }
 
 #[allow(non_camel_case_types)]
@@ -724,6 +778,13 @@ struct EVP_AEAD_CTX {
 #[allow(non_camel_case_types)]
 #[repr(transparent)]
 struct EVP_MD(c_void);
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+struct AES_KEY {
+    rd_key: [u32; 240],
+    rounds: libc::c_uint,
+}
 
 extern {
     // EVP_AEAD
@@ -767,6 +828,19 @@ extern {
         out_key: *mut u8, out_len: usize, digest: *const EVP_MD, prk: *const u8,
         prk_len: usize, info: *const u8, info_len: usize,
     ) -> c_int;
+
+    // AES
+    fn AES_set_encrypt_key(
+        key: *const u8, bits: libc::c_uint, aes_key: *mut AES_KEY,
+    ) -> c_int;
+
+    fn AES_encrypt(input: *const u8, output: *mut u8, key: *const AES_KEY);
+
+    // ChaCha20
+    fn CRYPTO_chacha_20(
+        out: *mut u8, inp: *const u8, in_len: usize, key: *const [u8; 32],
+        nonce: *const [u8; 12], counter: u32,
+    );
 }
 
 #[cfg(test)]
