@@ -27,7 +27,6 @@
 use std::mem::MaybeUninit;
 
 use ring::aead;
-use ring::hkdf;
 
 use libc::c_int;
 use libc::c_void;
@@ -89,11 +88,19 @@ impl Algorithm {
         }
     }
 
-    fn get_ring_digest(self) -> hkdf::Algorithm {
+    fn get_evp_md(self) -> *const EVP_MD {
         match self {
-            Algorithm::AES128_GCM => hkdf::HKDF_SHA256,
-            Algorithm::AES256_GCM => hkdf::HKDF_SHA384,
-            Algorithm::ChaCha20_Poly1305 => hkdf::HKDF_SHA256,
+            Self::AES128_GCM => unsafe { EVP_sha256() },
+            Self::AES256_GCM => unsafe { EVP_sha384() },
+            Self::ChaCha20_Poly1305 => unsafe { EVP_sha256() },
+        }
+    }
+
+    fn prk_len(self) -> usize {
+        match self {
+            Algorithm::AES128_GCM => 32,
+            Algorithm::AES256_GCM => 48,
+            Algorithm::ChaCha20_Poly1305 => 32,
         }
     }
 
@@ -426,6 +433,75 @@ impl PacketKey {
     }
 }
 
+pub struct Prk {
+    alg: Algorithm,
+    key: Vec<u8>,
+}
+
+impl Prk {
+    pub fn new(alg: Algorithm, salt: &[u8], secret: &[u8]) -> Result<Self> {
+        let md = alg.get_evp_md();
+
+        let mut prk = vec![0; alg.prk_len()];
+        let mut prk_len = 0;
+
+        let result = unsafe {
+            HKDF_extract(
+                prk.as_mut_ptr(),
+                &mut prk_len,
+                md,
+                secret.as_ptr(),
+                secret.len(),
+                salt.as_ptr(),
+                salt.len(),
+            )
+        };
+        if result == 1 {
+            debug_assert_eq!(prk_len, prk.len());
+            Ok(Self { alg, key: prk })
+        } else {
+            Err(Error::CryptoFail)
+        }
+    }
+
+    pub fn new_less_safe(alg: Algorithm, value: &[u8]) -> Self {
+        Self {
+            alg,
+            key: Vec::from(value),
+        }
+    }
+
+    pub fn expand(
+        &self, info: &[&[u8]], len: usize, out: &mut [u8],
+    ) -> Result<()> {
+        let md = self.alg.get_evp_md();
+
+        if len > 255 * self.alg.prk_len() {
+            return Err(Error::CryptoFail);
+        }
+
+        let info: Vec<u8> =
+            info.iter().flat_map(|&x| x.iter()).copied().collect();
+
+        let result = unsafe {
+            HKDF_expand(
+                out.as_mut_ptr(),
+                len,
+                md,
+                self.key.as_ptr(),
+                self.key.len(),
+                info.as_ptr(),
+                info.len(),
+            )
+        };
+        if result == 1 {
+            Ok(())
+        } else {
+            Err(Error::CryptoFail)
+        }
+    }
+}
+
 pub fn derive_initial_key_material(
     cid: &[u8], version: u32, is_server: bool,
 ) -> Result<(Open, Seal)> {
@@ -437,7 +513,7 @@ pub fn derive_initial_key_material(
     let key_len = aead.key_len();
     let nonce_len = aead.nonce_len();
 
-    let initial_secret = derive_initial_secret(cid, version);
+    let initial_secret = derive_initial_secret(cid, version)?;
 
     // Client.
     let mut client_key = vec![0; key_len];
@@ -498,7 +574,7 @@ pub fn derive_initial_key_material(
     Ok((open, seal))
 }
 
-fn derive_initial_secret(secret: &[u8], version: u32) -> hkdf::Prk {
+fn derive_initial_secret(secret: &[u8], version: u32) -> Result<Prk> {
     const INITIAL_SALT_V1: [u8; 20] = [
         0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6,
         0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
@@ -510,16 +586,15 @@ fn derive_initial_secret(secret: &[u8], version: u32) -> hkdf::Prk {
         _ => &INITIAL_SALT_V1,
     };
 
-    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, salt);
-    salt.extract(secret)
+    Prk::new(Algorithm::AES128_GCM, salt, secret)
 }
 
-fn derive_client_initial_secret(prk: &hkdf::Prk, out: &mut [u8]) -> Result<()> {
+fn derive_client_initial_secret(prk: &Prk, out: &mut [u8]) -> Result<()> {
     const LABEL: &[u8] = b"client in";
     hkdf_expand_label(prk, LABEL, out)
 }
 
-fn derive_server_initial_secret(prk: &hkdf::Prk, out: &mut [u8]) -> Result<()> {
+fn derive_server_initial_secret(prk: &Prk, out: &mut [u8]) -> Result<()> {
     const LABEL: &[u8] = b"server in";
     hkdf_expand_label(prk, LABEL, out)
 }
@@ -529,7 +604,7 @@ fn derive_next_secret(aead: Algorithm, secret: &[u8]) -> Result<Vec<u8>> {
 
     let mut next_secret = vec![0; secret.len()];
 
-    let secret_prk = hkdf::Prk::new_less_safe(aead.get_ring_digest(), secret);
+    let secret_prk = Prk::new_less_safe(aead, secret);
     hkdf_expand_label(&secret_prk, LABEL, &mut next_secret)?;
 
     Ok(next_secret)
@@ -546,7 +621,7 @@ pub fn derive_hdr_key(
         return Err(Error::CryptoFail);
     }
 
-    let secret = hkdf::Prk::new_less_safe(aead.get_ring_digest(), secret);
+    let secret = Prk::new_less_safe(aead, secret);
     hkdf_expand_label(&secret, LABEL, &mut out[..key_len])
 }
 
@@ -561,7 +636,7 @@ pub fn derive_pkt_key(
         return Err(Error::CryptoFail);
     }
 
-    let secret = hkdf::Prk::new_less_safe(aead.get_ring_digest(), secret);
+    let secret = Prk::new_less_safe(aead, secret);
     hkdf_expand_label(&secret, LABEL, &mut out[..key_len])
 }
 
@@ -576,7 +651,7 @@ pub fn derive_pkt_iv(
         return Err(Error::CryptoFail);
     }
 
-    let secret = hkdf::Prk::new_less_safe(aead.get_ring_digest(), secret);
+    let secret = Prk::new_less_safe(aead, secret);
     hkdf_expand_label(&secret, LABEL, &mut out[..nonce_len])
 }
 
@@ -605,22 +680,16 @@ fn make_aead_ctx(alg: Algorithm, key: &[u8]) -> Result<EVP_AEAD_CTX> {
     Ok(ctx)
 }
 
-fn hkdf_expand_label(
-    prk: &hkdf::Prk, label: &[u8], out: &mut [u8],
-) -> Result<()> {
+fn hkdf_expand_label(prk: &Prk, label: &[u8], out: &mut [u8]) -> Result<()> {
     const LABEL_PREFIX: &[u8] = b"tls13 ";
 
     let out_len = (out.len() as u16).to_be_bytes();
     let label_len = (LABEL_PREFIX.len() + label.len()) as u8;
 
-    let info = [&out_len, &[label_len][..], LABEL_PREFIX, label, &[0][..]];
+    let info: [&[u8]; 5] =
+        [&out_len, &[label_len][..], LABEL_PREFIX, label, &[0][..]];
 
-    prk.expand(&info, ArbitraryOutputLen(out.len()))
-        .map_err(|_| Error::CryptoFail)?
-        .fill(out)
-        .map_err(|_| Error::CryptoFail)?;
-
-    Ok(())
+    prk.expand(&info, out.len(), out)
 }
 
 fn make_nonce(iv: &[u8], counter: u64) -> [u8; aead::NONCE_LEN] {
@@ -636,17 +705,6 @@ fn make_nonce(iv: &[u8], counter: u64) -> [u8; aead::NONCE_LEN] {
     nonce
 }
 
-// The ring HKDF expand() API does not accept an arbitrary output length, so we
-// need to hide the `usize` length as part of a type that implements the trait
-// `ring::hkdf::KeyType` in order to trick ring into accepting it.
-struct ArbitraryOutputLen(usize);
-
-impl hkdf::KeyType for ArbitraryOutputLen {
-    fn len(&self) -> usize {
-        self.0
-    }
-}
-
 #[allow(non_camel_case_types)]
 #[repr(transparent)]
 struct EVP_AEAD(c_void);
@@ -654,6 +712,7 @@ struct EVP_AEAD(c_void);
 // NOTE: This structure is copied from <openssl/aead.h> in order to be able to
 // statically allocate it. While it is not often modified upstream, it needs to
 // be kept in sync.
+#[allow(non_camel_case_types)]
 #[repr(C)]
 struct EVP_AEAD_CTX {
     aead: libc::uintptr_t,
@@ -661,6 +720,10 @@ struct EVP_AEAD_CTX {
     alignment: u64,
     tag_len: u8,
 }
+
+#[allow(non_camel_case_types)]
+#[repr(transparent)]
+struct EVP_MD(c_void);
 
 extern {
     // EVP_AEAD
@@ -688,6 +751,22 @@ extern {
         nonce_len: usize, inp: *const u8, in_len: usize, extra_in: *const u8,
         extra_in_len: usize, ad: *const u8, ad_len: usize,
     ) -> c_int;
+
+    // EVP_MD
+    fn EVP_sha256() -> *const EVP_MD;
+
+    fn EVP_sha384() -> *const EVP_MD;
+
+    // HKDF
+    fn HKDF_extract(
+        out_key: *mut u8, out_len: *mut usize, digest: *const EVP_MD,
+        secret: *const u8, secret_len: usize, salt: *const u8, salt_len: usize,
+    ) -> c_int;
+
+    fn HKDF_expand(
+        out_key: *mut u8, out_len: usize, digest: *const EVP_MD, prk: *const u8,
+        prk_len: usize, info: *const u8, info_len: usize,
+    ) -> c_int;
 }
 
 #[cfg(test)]
@@ -706,7 +785,7 @@ mod tests {
         let aead = Algorithm::AES128_GCM;
 
         let initial_secret =
-            derive_initial_secret(&dcid, crate::PROTOCOL_VERSION_V1);
+            derive_initial_secret(&dcid, crate::PROTOCOL_VERSION_V1).unwrap();
 
         // Client.
         assert!(
