@@ -170,36 +170,13 @@ impl Open {
         }
 
         let tag_len = self.alg().tag_len();
-
-        let mut out_len = match buf.len().checked_sub(tag_len) {
-            Some(n) => n,
-            None => return Err(Error::CryptoFail),
-        };
-
-        let max_out_len = out_len;
-
-        let nonce = make_nonce(&self.packet.nonce, counter);
-
-        let rc = unsafe {
-            EVP_AEAD_CTX_open(
-                &self.packet.ctx,   // ctx
-                buf.as_mut_ptr(),   // out
-                &mut out_len,       // out_len
-                max_out_len,        // max_out_len
-                nonce[..].as_ptr(), // nonce
-                nonce.len(),        // nonce_len
-                buf.as_ptr(),       // inp
-                buf.len(),          // in_len
-                ad.as_ptr(),        // ad
-                ad.len(),           // ad_len
-            )
-        };
-
-        if rc != 1 {
+        if tag_len > buf.len() {
             return Err(Error::CryptoFail);
         }
 
-        Ok(out_len)
+        let nonce = make_nonce(&self.packet.nonce, counter);
+
+        self.packet.ctx.open(buf, &nonce, ad)
     }
 
     pub fn new_mask(&self, sample: &[u8]) -> Result<[u8; 5]> {
@@ -289,13 +266,7 @@ impl Seal {
 
         let tag_len = self.alg().tag_len();
 
-        let mut out_tag_len = tag_len;
-
-        let (extra_in_ptr, extra_in_len) = match extra_in {
-            Some(v) => (v.as_ptr(), v.len()),
-
-            None => (std::ptr::null(), 0),
-        };
+        let extra_in_len = extra_in.map_or(0, |v| v.len());
 
         // Make sure all the outputs combined fit in the buffer.
         if in_len + tag_len + extra_in_len > buf.len() {
@@ -304,27 +275,12 @@ impl Seal {
 
         let nonce = make_nonce(&self.packet.nonce, counter);
 
-        let rc = unsafe {
-            EVP_AEAD_CTX_seal_scatter(
-                &self.packet.ctx,           // ctx
-                buf.as_mut_ptr(),           // out
-                buf[in_len..].as_mut_ptr(), // out_tag
-                &mut out_tag_len,           // out_tag_len
-                tag_len + extra_in_len,     // max_out_tag_len
-                nonce[..].as_ptr(),         // nonce
-                nonce.len(),                // nonce_len
-                buf.as_ptr(),               // inp
-                in_len,                     // in_len
-                extra_in_ptr,               // extra_in
-                extra_in_len,               // extra_in_len
-                ad.as_ptr(),                // ad
-                ad.len(),                   // ad_len
-            )
-        };
+        let (in_out, out_tag) = buf.split_at_mut(in_len);
 
-        if rc != 1 {
-            return Err(Error::CryptoFail);
-        }
+        let out_tag_len = self
+            .packet
+            .ctx
+            .seal_scatter(in_out, out_tag, &nonce, extra_in, ad)?;
 
         Ok(in_len + out_tag_len)
     }
@@ -409,7 +365,7 @@ pub struct PacketKey {
 impl PacketKey {
     pub fn new(alg: Algorithm, key: Vec<u8>, iv: Vec<u8>) -> Result<Self> {
         Ok(Self {
-            ctx: make_aead_ctx(alg, &key)?,
+            ctx: EVP_AEAD_CTX::new(alg, &key)?,
 
             nonce: iv,
         })
@@ -651,31 +607,6 @@ pub fn derive_pkt_iv(
     hkdf_expand_label(&secret, LABEL, &mut out[..nonce_len])
 }
 
-fn make_aead_ctx(alg: Algorithm, key: &[u8]) -> Result<EVP_AEAD_CTX> {
-    let mut ctx = MaybeUninit::uninit();
-
-    let ctx = unsafe {
-        let aead = alg.get_evp_aead();
-
-        let rc = EVP_AEAD_CTX_init(
-            ctx.as_mut_ptr(),
-            aead,
-            key.as_ptr(),
-            alg.key_len(),
-            alg.tag_len(),
-            std::ptr::null_mut(),
-        );
-
-        if rc != 1 {
-            return Err(Error::CryptoFail);
-        }
-
-        ctx.assume_init()
-    };
-
-    Ok(ctx)
-}
-
 fn hkdf_expand_label(prk: &Prk, label: &[u8], out: &mut [u8]) -> Result<()> {
     const LABEL_PREFIX: &[u8] = b"tls13 ";
 
@@ -761,18 +692,129 @@ fn chacha_mask(key: &[u8], sample: &[u8; 16]) -> Result<[u8; 5]> {
 
 #[allow(non_camel_case_types)]
 #[repr(transparent)]
-struct EVP_AEAD(c_void);
+pub struct EVP_AEAD(c_void);
 
 // NOTE: This structure is copied from <openssl/aead.h> in order to be able to
 // statically allocate it. While it is not often modified upstream, it needs to
 // be kept in sync.
 #[allow(non_camel_case_types)]
 #[repr(C)]
-struct EVP_AEAD_CTX {
-    aead: libc::uintptr_t,
+pub struct EVP_AEAD_CTX {
+    aead: *const EVP_AEAD,
     opaque: [u8; 580],
     alignment: u64,
     tag_len: u8,
+}
+
+impl Drop for EVP_AEAD_CTX {
+    fn drop(&mut self) {
+        unsafe {
+            EVP_AEAD_CTX_cleanup(self);
+        }
+    }
+}
+
+unsafe impl Send for EVP_AEAD_CTX {}
+unsafe impl Sync for EVP_AEAD_CTX {}
+
+impl EVP_AEAD_CTX {
+    pub fn new(alg: Algorithm, key: &[u8]) -> Result<Self> {
+        if key.len() != alg.key_len() {
+            return Err(Error::CryptoFail);
+        }
+
+        let mut ctx = MaybeUninit::uninit();
+
+        // SAFETY: `key` & `ctx` are correctly sized.
+        // `ctx` will be initialized by `EVP_AEAD_CTX_init`.
+        let ctx = unsafe {
+            let aead = alg.get_evp_aead();
+
+            let rc = EVP_AEAD_CTX_init(
+                ctx.as_mut_ptr(),
+                aead,
+                key.as_ptr(),
+                alg.key_len(),
+                alg.tag_len(),
+                std::ptr::null_mut(),
+            );
+
+            if rc != 1 {
+                return Err(Error::CryptoFail);
+            }
+
+            ctx.assume_init()
+        };
+
+        Ok(ctx)
+    }
+
+    pub fn open(
+        &self, in_out: &mut [u8], nonce: &[u8; 12], ad: &[u8],
+    ) -> Result<usize> {
+        let mut out_len = 0;
+        let rc = unsafe {
+            EVP_AEAD_CTX_open(
+                self,
+                in_out.as_mut_ptr(),
+                &mut out_len,
+                in_out.len(),
+                nonce.as_ptr(),
+                nonce.len(),
+                in_out.as_ptr(),
+                in_out.len(),
+                ad.as_ptr(),
+                ad.len(),
+            )
+        };
+        if rc == 1 {
+            Ok(out_len)
+        } else {
+            Err(Error::CryptoFail)
+        }
+    }
+
+    pub fn seal_scatter(
+        &self, in_out: &mut [u8], out_tag: &mut [u8], nonce: &[u8; 12],
+        extra_in: Option<&[u8]>, ad: &[u8],
+    ) -> Result<usize> {
+        let extra_in_len = extra_in.map_or(0, |v| v.len());
+        let max_out_tag_len = self.overhead() + extra_in_len;
+
+        // Ensure out_tag is large enough
+        if max_out_tag_len > out_tag.len() {
+            return Err(Error::CryptoFail);
+        }
+
+        let mut out_tag_len = 0;
+        let rc = unsafe {
+            EVP_AEAD_CTX_seal_scatter(
+                self,
+                in_out.as_mut_ptr(),
+                out_tag.as_mut_ptr(),
+                &mut out_tag_len,
+                max_out_tag_len,
+                nonce.as_ptr(),
+                nonce.len(),
+                in_out.as_ptr(),
+                in_out.len(),
+                extra_in.map_or(std::ptr::null(), |v| v.as_ptr()),
+                extra_in_len,
+                ad.as_ptr(),
+                ad.len(),
+            )
+        };
+
+        if rc == 1 {
+            Ok(out_tag_len)
+        } else {
+            Err(Error::CryptoFail)
+        }
+    }
+
+    fn overhead(&self) -> usize {
+        unsafe { EVP_AEAD_max_overhead(self.aead) }
+    }
 }
 
 #[allow(non_camel_case_types)]
@@ -794,11 +836,15 @@ extern {
 
     fn EVP_aead_chacha20_poly1305() -> *const EVP_AEAD;
 
+    fn EVP_AEAD_max_overhead(aead: *const EVP_AEAD) -> usize;
+
     // EVP_AEAD_CTX
     fn EVP_AEAD_CTX_init(
         ctx: *mut EVP_AEAD_CTX, aead: *const EVP_AEAD, key: *const u8,
         key_len: usize, tag_len: usize, engine: *mut c_void,
     ) -> c_int;
+
+    fn EVP_AEAD_CTX_cleanup(ctx: *mut EVP_AEAD_CTX);
 
     fn EVP_AEAD_CTX_open(
         ctx: *const EVP_AEAD_CTX, out: *mut u8, out_len: *mut usize,
