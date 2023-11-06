@@ -348,11 +348,13 @@ impl HeaderProtectionKey {
         let sample: &[u8; SAMPLE_LEN] =
             TryFrom::try_from(sample).map_err(|_| Error::CryptoFail)?;
 
-        match self.alg {
-            Algorithm::AES128_GCM => aes_mask(128, &self.hp_key, sample),
-            Algorithm::AES256_GCM => aes_mask(256, &self.hp_key, sample),
-            Algorithm::ChaCha20_Poly1305 => chacha_mask(&self.hp_key, sample),
-        }
+        Ok(match self.alg {
+            Algorithm::AES128_GCM =>
+                AES_KEY::new(128, &self.hp_key)?.new_mask(sample),
+            Algorithm::AES256_GCM =>
+                AES_KEY::new(256, &self.hp_key)?.new_mask(sample),
+            Algorithm::ChaCha20_Poly1305 => chacha_mask(&self.hp_key, sample)?,
+        })
     }
 }
 
@@ -632,39 +634,6 @@ fn make_nonce(iv: &[u8], counter: u64) -> [u8; 12] {
     nonce
 }
 
-fn make_aes(bits: u16, key: &[u8]) -> Result<AES_KEY> {
-    let mut aes_key = MaybeUninit::uninit();
-
-    let aes_key = unsafe {
-        let rc = AES_set_encrypt_key(
-            key.as_ptr(),
-            bits as libc::c_uint,
-            aes_key.as_mut_ptr(),
-        );
-
-        if rc != 0 {
-            return Err(Error::CryptoFail);
-        }
-
-        aes_key.assume_init()
-    };
-
-    Ok(aes_key)
-}
-
-fn aes_mask(bits: u16, key: &[u8], sample: &[u8; 16]) -> Result<[u8; 5]> {
-    let aes = make_aes(bits, key)?;
-
-    let mut block = [0; 16];
-    unsafe {
-        AES_encrypt(sample.as_ptr(), block.as_mut_ptr(), &aes);
-    }
-
-    let mut out = [0; 5];
-    out.copy_from_slice(&block[..5]);
-    Ok(out)
-}
-
 fn chacha_mask(key: &[u8], sample: &[u8; 16]) -> Result<[u8; 5]> {
     let mut out = [0; 5];
 
@@ -821,11 +790,51 @@ impl EVP_AEAD_CTX {
 #[repr(transparent)]
 struct EVP_MD(c_void);
 
+// NOTE: This structure is copied `aes_key_st` from <openssl/aes.h>
 #[allow(non_camel_case_types)]
 #[repr(C)]
-struct AES_KEY {
+pub struct AES_KEY {
     rd_key: [u32; 240],
     rounds: libc::c_uint,
+}
+
+impl AES_KEY {
+    pub fn new(bits: u16, key: &[u8]) -> Result<Self> {
+        if key.len() != bits as usize / 8 {
+            return Err(Error::CryptoFail);
+        }
+
+        let mut aes_key = MaybeUninit::uninit();
+
+        // SAFETY: `key` & `aes_key` are correctly sized.
+        // `aes_key` will be initialized by `AES_set_encrypt_key`.
+        let aes_key = unsafe {
+            let rc = AES_set_encrypt_key(
+                key.as_ptr(),
+                bits as libc::c_uint,
+                aes_key.as_mut_ptr(),
+            );
+
+            if rc != 0 {
+                return Err(Error::CryptoFail);
+            }
+
+            aes_key.assume_init()
+        };
+
+        Ok(aes_key)
+    }
+
+    pub fn new_mask(&self, sample: &[u8; 16]) -> [u8; 5] {
+        let mut block = [0; 16];
+        unsafe {
+            AES_encrypt(sample.as_ptr(), block.as_mut_ptr(), self);
+        }
+
+        let mut out = [0; 5];
+        out.copy_from_slice(&block[..5]);
+        out
+    }
 }
 
 extern {
