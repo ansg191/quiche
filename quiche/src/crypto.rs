@@ -401,13 +401,13 @@ impl Prk {
 
         let result = unsafe {
             HKDF_extract(
-                prk.as_mut_ptr(),
-                &mut prk_len,
-                md,
-                secret.as_ptr(),
-                secret.len(),
-                salt.as_ptr(),
-                salt.len(),
+                prk.as_mut_ptr(), // out_key
+                &mut prk_len,     // out_len
+                md,               // digest
+                secret.as_ptr(),  // secret
+                secret.len(),     // secret_len
+                salt.as_ptr(),    // salt
+                salt.len(),       // salt_len
             )
         };
         if result == 1 {
@@ -439,13 +439,13 @@ impl Prk {
 
         let result = unsafe {
             HKDF_expand(
-                out.as_mut_ptr(),
-                len,
-                md,
-                self.key.as_ptr(),
-                self.key.len(),
-                info.as_ptr(),
-                info.len(),
+                out.as_mut_ptr(),  // out_key
+                len,               // out_len
+                md,                // digest
+                self.key.as_ptr(), // prk
+                self.key.len(),    // prk_len
+                info.as_ptr(),     // info
+                info.len(),        // info_len
             )
         };
         if result == 1 {
@@ -647,12 +647,12 @@ fn chacha_mask(key: &[u8], sample: &[u8; 16]) -> Result<[u8; 5]> {
 
     unsafe {
         CRYPTO_chacha_20(
-            out.as_mut_ptr(),
-            out.as_ptr(),
-            out.len(),
-            key,
-            nonce,
-            counter,
+            out.as_mut_ptr(), // out
+            out.as_ptr(),     // in
+            out.len(),        // in_len
+            key,              // key
+            nonce,            // nonce
+            counter,          // counter
         )
     }
 
@@ -700,12 +700,12 @@ impl EVP_AEAD_CTX {
             let aead = alg.get_evp_aead();
 
             let rc = EVP_AEAD_CTX_init(
-                ctx.as_mut_ptr(),
-                aead,
-                key.as_ptr(),
-                alg.key_len(),
-                alg.tag_len(),
-                std::ptr::null_mut(),
+                ctx.as_mut_ptr(),     // ctx
+                aead,                 // aead
+                key.as_ptr(),         // key
+                alg.key_len(),        // key_len
+                alg.tag_len(),        // tag_len
+                std::ptr::null_mut(), // engine
             );
 
             if rc != 1 {
@@ -724,16 +724,16 @@ impl EVP_AEAD_CTX {
         let mut out_len = 0;
         let rc = unsafe {
             EVP_AEAD_CTX_open(
-                self,
-                in_out.as_mut_ptr(),
-                &mut out_len,
-                in_out.len(),
-                nonce.as_ptr(),
-                nonce.len(),
-                in_out.as_ptr(),
-                in_out.len(),
-                ad.as_ptr(),
-                ad.len(),
+                self,                // ctx
+                in_out.as_mut_ptr(), // out
+                &mut out_len,        // out_len
+                in_out.len(),        // max_out_len
+                nonce.as_ptr(),      // nonce
+                nonce.len(),         // nonce_len
+                in_out.as_ptr(),     // inp
+                in_out.len(),        // in_len
+                ad.as_ptr(),         // ad
+                ad.len(),            // ad_len
             )
         };
         if rc == 1 {
@@ -755,22 +755,24 @@ impl EVP_AEAD_CTX {
             return Err(Error::CryptoFail);
         }
 
+        let extra_in = extra_in.map_or(std::ptr::null(), |v| v.as_ptr());
+
         let mut out_tag_len = 0;
         let rc = unsafe {
             EVP_AEAD_CTX_seal_scatter(
-                self,
-                in_out.as_mut_ptr(),
-                out_tag.as_mut_ptr(),
-                &mut out_tag_len,
-                max_out_tag_len,
-                nonce.as_ptr(),
-                nonce.len(),
-                in_out.as_ptr(),
-                in_out.len(),
-                extra_in.map_or(std::ptr::null(), |v| v.as_ptr()),
-                extra_in_len,
-                ad.as_ptr(),
-                ad.len(),
+                self,                 // ctx
+                in_out.as_mut_ptr(),  // out
+                out_tag.as_mut_ptr(), // out_tag
+                &mut out_tag_len,     // out_tag_len
+                max_out_tag_len,      // max_out_tag_len
+                nonce.as_ptr(),       // nonce
+                nonce.len(),          // nonce_len
+                in_out.as_ptr(),      // inp
+                in_out.len(),         // in_len
+                extra_in,             // extra_in
+                extra_in_len,         // extra_in_len
+                ad.as_ptr(),          // ad
+                ad.len(),             // ad_len
             )
         };
 
@@ -810,9 +812,9 @@ impl AES_KEY {
         // `aes_key` will be initialized by `AES_set_encrypt_key`.
         let aes_key = unsafe {
             let rc = AES_set_encrypt_key(
-                key.as_ptr(),
-                bits as libc::c_uint,
-                aes_key.as_mut_ptr(),
+                key.as_ptr(),         // key
+                bits as libc::c_uint, // bits
+                aes_key.as_mut_ptr(), // aes_key
             );
 
             if rc != 0 {
