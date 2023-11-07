@@ -425,12 +425,10 @@ impl Prk {
         }
     }
 
-    pub fn expand(
-        &self, info: &[&[u8]], len: usize, out: &mut [u8],
-    ) -> Result<()> {
+    pub fn expand(&self, info: &[&[u8]], out: &mut [u8]) -> Result<()> {
         let md = self.alg.get_evp_md();
 
-        if len > 255 * self.alg.prk_len() {
+        if out.len() > 255 * self.alg.prk_len() {
             return Err(Error::CryptoFail);
         }
 
@@ -440,7 +438,7 @@ impl Prk {
         let result = unsafe {
             HKDF_expand(
                 out.as_mut_ptr(),  // out_key
-                len,               // out_len
+                out.len(),         // out_len
                 md,                // digest
                 self.key.as_ptr(), // prk
                 self.key.len(),    // prk_len
@@ -618,7 +616,7 @@ fn hkdf_expand_label(prk: &Prk, label: &[u8], out: &mut [u8]) -> Result<()> {
     let info: [&[u8]; 5] =
         [&out_len, &[label_len][..], LABEL_PREFIX, label, &[0][..]];
 
-    prk.expand(&info, out.len(), out)
+    prk.expand(&info, out)
 }
 
 fn make_nonce(iv: &[u8], counter: u64) -> [u8; 12] {
