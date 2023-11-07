@@ -657,6 +657,19 @@ fn chacha_mask(key: &[u8], sample: &[u8; 16]) -> Result<[u8; 5]> {
     Ok(out)
 }
 
+pub fn constant_time_eq(a: impl AsRef<[u8]>, b: impl AsRef<[u8]>) -> bool {
+    let a = a.as_ref();
+    let b = b.as_ref();
+
+    if a.len() != b.len() {
+        return false;
+    }
+
+    let rc =
+        unsafe { CRYPTO_memcmp(a.as_ptr().cast(), b.as_ptr().cast(), a.len()) };
+    rc == 0
+}
+
 #[allow(non_camel_case_types)]
 #[repr(transparent)]
 pub struct EVP_AEAD(c_void);
@@ -896,6 +909,9 @@ extern {
         out: *mut u8, inp: *const u8, in_len: usize, key: *const [u8; 32],
         nonce: *const [u8; 12], counter: u32,
     );
+
+    // memcmp
+    fn CRYPTO_memcmp(a: *const c_void, b: *const c_void, len: usize) -> c_int;
 }
 
 #[cfg(test)]

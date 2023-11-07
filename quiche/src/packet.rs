@@ -30,12 +30,11 @@ use std::ops::IndexMut;
 use std::ops::RangeInclusive;
 use std::time;
 
-use ring::aead;
-
 use crate::Error;
 use crate::Result;
 
 use crate::crypto;
+use crate::crypto::Algorithm;
 use crate::rand;
 use crate::ranges;
 use crate::stream;
@@ -404,11 +403,11 @@ impl<'a> Header<'a> {
 
             Type::Retry => {
                 // Exclude the integrity tag from the token.
-                if b.cap() < aead::AES_128_GCM.tag_len() {
+                if b.cap() < Algorithm::AES128_GCM.tag_len() {
                     return Err(Error::InvalidPacket);
                 }
 
-                let token_len = b.cap() - aead::AES_128_GCM.tag_len();
+                let token_len = b.cap() - Algorithm::AES128_GCM.tag_len();
                 token = Some(b.get_bytes(token_len)?.to_vec());
             },
 
@@ -786,24 +785,25 @@ pub fn verify_retry_integrity(
 ) -> Result<()> {
     let tag = compute_retry_integrity_tag(b, odcid, version)?;
 
-    ring::constant_time::verify_slices_are_equal(
-        &b.as_ref()[..aead::AES_128_GCM.tag_len()],
-        tag.as_ref(),
-    )
-    .map_err(|_| Error::CryptoFail)?;
-
-    Ok(())
+    if crypto::constant_time_eq(
+        &b.as_ref()[..Algorithm::AES128_GCM.tag_len()],
+        tag,
+    ) {
+        Ok(())
+    } else {
+        Err(Error::CryptoFail)
+    }
 }
 
 fn compute_retry_integrity_tag(
     b: &octets::OctetsMut, odcid: &[u8], version: u32,
-) -> Result<aead::Tag> {
+) -> Result<[u8; 16]> {
     const RETRY_INTEGRITY_KEY_V1: [u8; 16] = [
         0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54,
         0xe3, 0x68, 0xc8, 0x4e,
     ];
 
-    const RETRY_INTEGRITY_NONCE_V1: [u8; aead::NONCE_LEN] = [
+    const RETRY_INTEGRITY_NONCE_V1: [u8; 12] = [
         0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
     ];
 
@@ -824,17 +824,13 @@ fn compute_retry_integrity_tag(
     pb.put_bytes(odcid)?;
     pb.put_bytes(&b.buf()[..hdr_len])?;
 
-    let key = aead::LessSafeKey::new(
-        aead::UnboundKey::new(&aead::AES_128_GCM, key)
-            .map_err(|_| Error::CryptoFail)?,
-    );
+    let ctx = crypto::EVP_AEAD_CTX::new(Algorithm::AES128_GCM, key)?;
 
-    let nonce = aead::Nonce::assume_unique_for_key(nonce);
+    let mut tag = [0; 16];
 
-    let aad = aead::Aad::from(&pseudo);
+    ctx.seal_scatter(&mut [], &mut tag, &nonce, None, &pseudo)?;
 
-    key.seal_in_place_separate_tag(nonce, aad, &mut [])
-        .map_err(|_| Error::CryptoFail)
+    Ok(tag)
 }
 
 pub struct KeyUpdate {
